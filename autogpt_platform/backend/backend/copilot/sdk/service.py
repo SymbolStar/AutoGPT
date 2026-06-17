@@ -790,6 +790,34 @@ async def _consume_sdk_until_done(
             and acc.accumulated_tool_calls
             and not acc.has_tool_results
         )
+        # Companion guard for the split-AssistantMessage case (#13377).
+        # ``has_pending_tools`` only catches text + tool_use that share a
+        # single ``AssistantMessage`` — by the time we hit the flush gate
+        # ``accumulated_tool_calls`` is already populated.
+        #
+        # When the model splits the turn into TWO AssistantMessage events
+        # (text-only, then tool_use-only) the SDK adapter ends the text
+        # block (``has_open_block=False``) and ``accumulated_tool_calls``
+        # is still empty in the gap.  A flush here would persist the
+        # text-only assistant row at its current ``sequence``; the later
+        # ``StreamToolInputAvailable`` would attach ``tool_calls`` to the
+        # same in-memory ChatMessage but the append-only DB writer skips
+        # rows that already have a ``sequence`` — the ``tool_calls`` are
+        # lost forever and the eventual tool_result lands as an orphan.
+        #
+        # Defer the intermediate flush whenever the trailing in-memory row
+        # is an unsaved assistant row that has accumulated text but has
+        # not yet attached ``tool_calls`` and has not yet seen a tool
+        # result this turn.  The follow-up tool_use (if any) can then
+        # back-fill ``tool_calls`` on the same row before persistence;
+        # for genuinely tool-less text turns the flush is just deferred
+        # to the next eligible message boundary or to the end-of-turn
+        # ``finally`` upsert — page-reload progress is unaffected because
+        # the row is still in-memory and the next ResultMessage / tool
+        # event clears the guard.
+        trailing_unsaved_assistant_text = _has_trailing_unsaved_assistant_text(
+            ctx.session, acc.has_tool_results
+        )
         adapter = state.adapter
         has_open_block = (adapter.has_started_text and not adapter.has_ended_text) or (
             adapter.has_started_reasoning and not adapter.has_ended_reasoning
@@ -797,6 +825,7 @@ async def _consume_sdk_until_done(
         if (
             not has_pending_tools
             and not has_open_block
+            and not trailing_unsaved_assistant_text
             and (
                 loop_state.msgs_since_flush >= _FLUSH_MESSAGE_THRESHOLD
                 or (now - loop_state.last_flush_time) >= _FLUSH_INTERVAL_SECONDS
@@ -837,6 +866,52 @@ _THINKING_ONLY_REPROMPT = (
 # session-message flush so page reloads show progress on long turns.
 _FLUSH_INTERVAL_SECONDS = 30.0
 _FLUSH_MESSAGE_THRESHOLD = 10
+
+
+def _has_trailing_unsaved_assistant_text(
+    session: ChatSession, has_tool_results: bool
+) -> bool:
+    """Return True when the trailing in-memory assistant row is an
+    unsaved text-only row that could still receive ``tool_calls`` from a
+    follow-up SDK ``AssistantMessage``.
+
+    Used by the intermediate-flush gate to defer persistence in the
+    split text + tool_use case described in issue #13377: the DB writer
+    is append-only by ``sequence`` and rows whose ``sequence`` is already
+    set are skipped, so flushing a text-only assistant row in the gap
+    between the two AssistantMessage events would permanently lose any
+    ``tool_calls`` attached by the follow-up event.
+
+    The check is intentionally narrow:
+
+    * Only triggers for an ``assistant`` row.
+    * Requires ``sequence is None`` — already-persisted rows can’t be
+      back-filled either way and a future flush is harmless.
+    * Requires empty ``tool_calls`` — once tool_calls have attached the
+      existing ``has_pending_tools`` gate (which also checks
+      ``has_tool_results``) takes over.
+    * Requires non-empty ``content`` — an empty placeholder row from the
+      post-tool pre-create path is not at risk and we want progress to
+      flush as soon as real text accumulates.
+    * Requires ``not has_tool_results`` — once this turn has yielded a
+      tool result the assistant row’s tool_calls must already be set
+      (the SDK can’t deliver a tool_result without a matching tool_use)
+      and further deferral would just delay progress.
+    """
+    if not session.messages:
+        return False
+    last_msg = session.messages[-1]
+    if last_msg.role != "assistant":
+        return False
+    if last_msg.sequence is not None:
+        return False
+    if last_msg.tool_calls:
+        return False
+    if not last_msg.content:
+        return False
+    if has_tool_results:
+        return False
+    return True
 
 
 def _hidden_short_names_for_permissions(

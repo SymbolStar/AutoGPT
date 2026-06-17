@@ -460,3 +460,183 @@ class TestPruneOrphanToolCallsLogging:
 
         assert removed == 1
         assert caplog.text == ""
+
+
+class TestTrailingUnsavedAssistantTextGuard:
+    """Regression coverage for issue #13377.
+
+    When the model splits a single assistant turn into two
+    ``AssistantMessage`` SDK events (text-only first, ``tool_use``-only
+    second) and an intermediate flush fires in the gap, the text-only
+    assistant row used to be persisted at its current ``sequence`` with
+    ``toolCalls=null``.  The DB writer is append-only by sequence, so
+    the follow-up ``tool_use``'s ``tool_calls`` assignment was silently
+    lost.  The tool_result was still written, leaving the assistant row
+    orphan-free of its call \u2014 the frontend then dropped the tool card
+    on reload.
+
+    The fix defers the intermediate flush whenever the trailing
+    in-memory row is an unsaved assistant row that has accumulated text
+    but has not yet attached ``tool_calls`` and has not yet seen a tool
+    result this turn.  ``_has_trailing_unsaved_assistant_text`` is the
+    helper used by the gate.
+    """
+
+    @staticmethod
+    def _tool_call(call_id: str = "tc_1") -> dict:
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "bash_exec", "arguments": "{}"},
+        }
+
+    def test_unsaved_assistant_text_defers_flush(self) -> None:
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        session.messages.append(
+            ChatMessage(
+                role="assistant",
+                content="Let me set it up now.",
+                tool_calls=None,
+                sequence=None,
+            )
+        )
+
+        assert _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
+
+    def test_persisted_assistant_text_does_not_defer(self) -> None:
+        """Once a row has a ``sequence`` it has already been written;
+        back-fill is impossible regardless, so the guard releases."""
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        session.messages.append(
+            ChatMessage(
+                role="assistant",
+                content="Earlier reply.",
+                tool_calls=None,
+                sequence=4,
+            )
+        )
+
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
+
+    def test_assistant_with_tool_calls_does_not_defer(self) -> None:
+        """Once tool_calls have attached, the existing ``has_pending_tools``
+        gate covers the in-flight tool turn \u2014 this helper steps aside."""
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        session.messages.append(
+            ChatMessage(
+                role="assistant",
+                content="Let me set it up now.",
+                tool_calls=[self._tool_call()],
+                sequence=None,
+            )
+        )
+
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
+
+    def test_empty_placeholder_assistant_does_not_defer(self) -> None:
+        """The post-tool pre-create path appends an empty assistant row
+        before any deltas arrive; deferring here would needlessly stall
+        progress flushes for the post-tool reply."""
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        session.messages.append(
+            ChatMessage(role="assistant", content="", tool_calls=None, sequence=None)
+        )
+
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
+
+    def test_tool_result_received_does_not_defer(self) -> None:
+        """If this turn has already produced a tool result, the assistant
+        row's tool_calls must already exist \u2014 deferring would just delay
+        progress."""
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        session.messages.append(
+            ChatMessage(
+                role="assistant",
+                content="post-tool follow-up text",
+                tool_calls=None,
+                sequence=None,
+            )
+        )
+
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=True)
+
+    def test_trailing_tool_row_does_not_defer(self) -> None:
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        session.messages.append(
+            ChatMessage(
+                role="assistant",
+                content="call it",
+                tool_calls=[self._tool_call()],
+                sequence=5,
+            )
+        )
+        session.messages.append(
+            ChatMessage(
+                role="tool",
+                content="ok",
+                tool_call_id="tc_1",
+                sequence=None,
+            )
+        )
+
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=True)
+
+    def test_user_row_does_not_defer(self) -> None:
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        session.messages.append(
+            ChatMessage(role="user", content="hi", sequence=None)
+        )
+
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
+
+    def test_empty_session_does_not_defer(self) -> None:
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
+
+    def test_split_text_then_tool_use_back_fills_tool_calls(self) -> None:
+        """End-to-end shape check for the #13377 sequence:
+
+        1. text-only AssistantMessage \u2192 trailing row is unsaved text,
+           guard fires \u2192 intermediate flush is skipped.
+        2. tool_use-only AssistantMessage \u2192 ``StreamToolInputAvailable``
+           attaches ``tool_calls`` to the same in-memory row.
+        3. Guard now releases (tool_calls present) and the end-of-turn
+           upsert persists the row with its ``tool_calls`` intact.
+        """
+        from backend.copilot.sdk.service import _has_trailing_unsaved_assistant_text
+
+        session = _make_session()
+
+        # Step 1: text-only assistant row, no tool_calls yet, no tool result.
+        text_row = ChatMessage(
+            role="assistant",
+            content="Let me set it up now.",
+            tool_calls=None,
+            sequence=None,
+        )
+        session.messages.append(text_row)
+        assert _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
+
+        # Step 2: follow-up tool_use AssistantMessage attaches tool_calls
+        # to the SAME in-memory row (mirrors StreamToolInputAvailable).
+        text_row.tool_calls = [self._tool_call("tc_followup")]
+
+        # Step 3: guard releases so the end-of-turn upsert can persist
+        # the row with its tool_calls populated.
+        assert not _has_trailing_unsaved_assistant_text(session, has_tool_results=False)
